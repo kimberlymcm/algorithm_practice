@@ -17,8 +17,24 @@ from tensorflow_probability.python.internal import tensorshape_util
 from tensorflow_probability.python.util.seed_stream import SeedStream
 
 
+def generate_chain(initial_distribution, transition_distribution, observation_distribution,
+    num_steps):
+    hidden_chain = []
+    observed_chain = []
+    init_state = np.random.choice([0, 1], p=initial_distribution.probs_parameter())
+    curr_state = init_state
 
-#class BaumWelch(object):
+    for i in range(num_steps):
+        new_state = np.random.choice([0, 1], p=np.array(transition_distribution.probs_parameter())[curr_state])
+        hidden_chain.append(new_state)
+        new_obs = observation_distribution.sample(1)[0][new_state]
+        observed_chain.append(new_obs.numpy())
+        curr_state = new_state
+    return hidden_chain, observed_chain
+
+
+
+
 class BaumWelch(tfp.distributions.HiddenMarkovModel):
     # When you add an __init__ to the child class, it will no longer
     # inherit the init from the parent class
@@ -37,15 +53,8 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
 
     def __init__(self, initial_distribution, observation_distribution, transition_distribution, num_steps, epsilon = 0.001, maxStep = 10):
 
-        #super(tfp.distributions.HiddenMarkovModel, self).__init__(
-         #   self, initial_distribution, transition_distribution, observation_distribution, maxStep )
         super().__init__(initial_distribution, transition_distribution, observation_distribution, num_steps)
-        print(self._initial_distribution)
-        #super().__init__(self)
   
-        #tfp.distributions.HiddenMarkovModel.__init__(self, initial_distribution,
-        #    transition_distribution, observation_distribution, num_steps)
-        
         with tf.name_scope('Inital_Parameters'):
             with tf.name_scope('Scalar_constants'):
                 
@@ -56,11 +65,9 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
                 self.epsilon = epsilon 
 
                 # Number of possible states
-                #self.S = T.shape[0]
                 self.S = np.int(self.initial_distribution.num_categories)
 
                 # Number of possible observations
-                #self.O = E.shape[0]
                 self.O = np.int(self.initial_distribution.num_categories)
                 
                 self.prob_state_1 = []
@@ -70,7 +77,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
                 self.fb_array = tf.Variable(tf.zeros(self.O, dtype=tf.float64), name='posterior')
 
 
-    def forward_backward(self, obs_prob_seq):
+    def forward_backward(self, obs_prob_seq, x):
         """
         runs forward backward algorithm on observation sequence
         Arguments
@@ -86,13 +93,13 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
         - posterior : matrix of size N by S representing
             the posterior probability of each state at each time step
         """
-        obs_prob_list_for = tf.split(obs_prob_seq, self.N, 0)
-        
+        obs_prob_list_for = tf.split(obs_prob_seq, self.N, 0) # creates a list of tensors for each observation
+        observation_log_probs = self._observation_log_probs(x, mask=None)     
         with tf.name_scope('forward_belief_propagation'):
             # forward belief propagation
             print("BEFORE")
             print(self.forward_log_probs)
-            self._forward(obs_prob_list_for)
+            self._forward(observation_log_probs)
             print("AFTER")
             print(self.forward_log_probs)
 
@@ -101,88 +108,69 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
 
         with tf.name_scope('backward_belief_propagation'):
             # backward belief propagation
-            self._backward(obs_prob_list_back)
+            self._backward(observation_log_probs)
+        print(self.forward_log_probs)
+        print(self.backward_log_probs)
+        print("GOT THROUGH FORWARD BACKWARD")
 
-    def _forward(self, obs_prob_list):
+
+    def _forward(self, observation_log_probs):
         print("In forward!")
     
-        with tf.name_scope('init_scaling_factor'):
-            # KM: scale Variable with len(obs_seq) all 0s
-            self.scale = tf.Variable(tf.zeros([self.N], tf.float32)) #scale factors
-    
         with tf.name_scope('forward_first_step'):
-            # initialize with state starting priors
-            # KM: ??
-            # Manual: Given a tensor input, this operation returns a tensor of the same type with all dimensions of size 1 removed.
-            #init_prob = tf.multiply(self.T0, tf.squeeze(obs_prob_list[0]))
-            #print(self.initial_distribution)
-            # Should obs_prob_list add up to 1
-            #import pdb; pdb.set_trace()
-            #init_prob = tf.multiply(self.initial_distribution.parameters['probs'], tf.squeeze(obs_prob_list[0]))
-            #init_prob = tf.multiply(self.initial_distribution)
-            #print(obs_prob_list)
-            init_prob = tf.multiply(self.initial_distribution.probs_parameter(), tf.squeeze(obs_prob_list[0]))
-            #print(init_prob)
+            init_prob = self.initial_distribution.logits_parameter() + tf.squeeze(observation_log_probs[0])
+            log_transition = self.transition_distribution.logits_parameter()
+            log_adjoint_prob = tf.zeros_like(init_prob)
 
-            # scaling factor at t=0
-            # KM: reduce_sum(init_prob)just sums all
-            # scatter_update(ref, indices, update): Literally just replacing first value with
-            # 1.0/tf.reduce_sum(init_prob)
-            self.scale = tf.compat.v1.scatter_update(self.scale, 0, 1.0 / tf.reduce_sum(init_prob))
+            
+            def _scan_multiple_steps_forwards():
+                def forward_step(log_previous_step, log_prob_observation):
+                    return _log_vector_matrix(log_previous_step,
+                                              log_transition) + log_prob_observation
 
-            # scaled belief at t=0
-            # KM: Replacing first value in forward with scale[0]*init_prob
-            # KM: I THINK THESE SHOULD BE LOG BUT THEY AREN'T
-            self.forward_log_probs = tf.compat.v1.scatter_update(self.forward_log_probs, 0, tf.math.log(self.scale[0] * init_prob))
-            #self.forward_log_probs = tf.compat.v1.scatter_update(self.forward_log_probs, 0, self.scale[0] * init_prob)
+                forward_log_probs = tf.scan(forward_step, observation_log_probs[1:],
+                                    initializer=init_prob,
+                                    name="forward_log_probs")
+                return tf.concat([[init_prob], forward_log_probs], axis=0)
 
-        # propagate belief
-        # KM: for each observation
-        print("About to loop")
-        for step, obs_prob in enumerate(obs_prob_list[1:]):
-            with tf.name_scope('time_step-%s' %step):
-                # previous state probability (log)
-                prev_prob = tf.expand_dims(self.forward_log_probs[step, :], 0)
-                # transition prior
-                #import pdb; pdb.set_trace()
-                #prior_prob = tf.matmul(prev_prob, self.T)
-                prior_prob = _log_vector_matrix(prev_prob, self.transition_distribution.logits_parameter())
-                # forward belief propagation
-                #forward_score = tf.multiply(prior_prob, tf.squeeze(obs_prob))
-                forward_score = prior_prob + obs_prob # KM: assume log
-                forward_prob = tf.squeeze(forward_score)
-                # scaling factor
-                self.scale = tf.compat.v1.scatter_update(self.scale, step+1, 1.0 / tf.reduce_sum(forward_prob))
-                # Update forward matrix
-                self.forward_log_probs = tf.compat.v1.scatter_update(self.forward_log_probs, step+1, self.scale[step+1] * forward_prob)
+            forward_log_probs = prefer_static.cond(
+                self._num_steps > 1,
+                _scan_multiple_steps_forwards,
+                lambda: tf.convert_to_tensor([init_prob]))
+
+            total_log_prob = tf.reduce_logsumexp(forward_log_probs[-1], axis=-1)
+
+        self.forward_log_probs = forward_log_probs
     
 
-    def _backward(self, obs_prob_list):
-        with tf.name_scope('backward_last_step'):
-            # initialize with state ending priors
-            # import pdb; pdb.set_trace()
-            self.backward_log_probs = tf.compat.v1.scatter_update(self.backward_log_probs, 0, self.scale[self.N-1] * tf.ones([self.S], dtype=tf.float32)) 
+    def _backward(self, observation_log_probs):
+        init_prob = self.initial_distribution.logits_parameter() + tf.squeeze(observation_log_probs[0])
+        log_transition = self.transition_distribution.logits_parameter()
+        log_adjoint_prob = tf.zeros_like(init_prob)
 
-        # propagate belief
-        for step, obs_prob in enumerate(obs_prob_list[:-1]):
-            with tf.name_scope('time_step-%s' %step):
-                # next state probability
-                next_prob = tf.expand_dims(self.backward_log_probs[step, :], 1)
-                # observation emission probabilities
-                obs_prob_d = tf.compat.v1.diag(tf.squeeze(obs_prob))
-                # transition prior
-                # prior_prob = tf.matmul(self.T, obs_prob_d)
-                prior_prob = _log_vector_matrix(self.transition_distribution.logits_parameter(), obs_prob_d)
-                # backward belief propagation
-                #backward_score = tf.matmul(prior_prob, next_prob)
-                backward_score = prior_prob + next_prob
+        def _scan_multiple_steps_backwards():
+            """Perform `scan` operation when `num_steps` > 1."""
 
-                backward_prob = tf.squeeze(backward_score)
+            def backward_step(log_previous_step, log_prob_observation):
+              return _log_matrix_vector(
+                  log_transition,
+                  log_prob_observation + log_previous_step)
 
-                # Update backward matrix
-                self.backward_log_probs = tf.compat.v1.scatter_update(self.backward_log_probs, step+1, self.scale[self.N-2-step] * backward_prob)
-        
-        self.backward_log_probs = tf.compat.v1.assign(self.backward_log_probs, tf.reverse(self.backward_log_probs, [True, False]))
+            backward_log_adjoint_probs = tf.scan(
+                backward_step,
+                observation_log_probs[1:],
+                initializer=log_adjoint_prob,
+                reverse=True,
+                name="backward_log_adjoint_probs")
+
+            return tf.concat([backward_log_adjoint_probs,
+                              [log_adjoint_prob]], axis=0)
+
+        backward_log_adjoint_probs = prefer_static.cond(
+            self._num_steps > 1,
+            _scan_multiple_steps_backwards,
+            lambda: tf.convert_to_tensor([log_adjoint_prob]))
+        self.backward_log_probs = backward_log_adjoint_probs
 
         
     def _posterior(self):
@@ -245,8 +233,8 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
                     # My attempt below
                     tmp_1 = tmp_0 + self._observation_distribution.log_prob(x[t+1])
                     denom = tf.squeeze(_log_vector_matrix(tmp_1, self.backward_log_probs[t+1, :]))
-                    print("DENOM")
-                    print(denom)
+                    #print("DENOM")
+                    #print(denom)
                     #denom = tf.squeeze(tf.matmul(tmp_1, tf.expand_dims(self.backward_log_probs[t+1, :], 1)))
 
                 with tf.name_scope('Init_new_transition'):
@@ -306,11 +294,6 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
 
         return tf.logical_and(tf.logical_and(delta_T0, delta_T), delta_E)
         
-    #def posterior_marginals(self, observations, mask=None, name=None):
-    #    print('hihihihi')
-    #    print(observations)
-    #    fb_array = self.posterior_marginals(observations, mask=None, name=None);
-    #    import pdb; pdb.set_trace()
 
 
     def expectation_maximization_step(self, x): # x is the observations
@@ -320,21 +303,15 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
         #obs_prob_seq = tf.gather(self.observation_distribution, x)
 
         # Hopefully this is the log probability of the observed sequence
-        print("x")
-        print(x)
-        print("observation")
-        print(self._observation_distribution)
-        print(self._observation_distribution.mean())
         #import pdb; pdb.set_trace()
 
-        obs_prob_seq = tf.math.exp(self._observation_log_probs(x, mask=None))
+        obs_prob_seq = tf.math.exp(self._observation_log_probs(x, mask=None)) # NOT LOGS
         print(obs_prob_seq)
-        #fb = self.posterior_marginals(x, mask=None, name=None)
 
         ## probability of emission sequence
         with tf.name_scope('Forward_Backward'):
             print("above to run forward_backward")
-            self.forward_backward(obs_prob_seq)
+            self.forward_backward(obs_prob_seq, x)
             self.fb_array = self.forward_log_probs + self.backward_log_probs
             # Not sure what is happening here
             # Not sure if I need to do this

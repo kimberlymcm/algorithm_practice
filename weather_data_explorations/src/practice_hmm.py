@@ -1,10 +1,14 @@
+import random
+
 import pandas as pd
 import numpy as np
 
 import tensorflow as tf
 import tensorflow_probability as tfp
 
-from BaumWelchAlg import BaumWelch
+from BaumWelchAlg import BaumWelch, generate_chain
+
+random.seed(400)
 
 hum_df = pd.read_csv("../data/historical-hourly-weather-data/humidity.csv",
                       index_col="datetime", parse_dates=["datetime"])
@@ -15,7 +19,7 @@ hum_df = hum_df.rename(columns={"Vancouver": "van"})
 print("hum_df.size after filtering for noon and NY: ", hum_df.size)
 
 hum_df = hum_df.assign(van_impute=hum_df.van.fillna(hum_df.van.median()))
-
+observations = tf.convert_to_tensor(hum_df.van_impute)
 
 tfd = tfp.distributions
 
@@ -35,10 +39,20 @@ transition_distribution = tfd.Categorical(probs=[[0.95, 0.05],
 # a cold day and mean and standard deviation 15 and 10 on a hot day.
 # We can model this with:
 
-observation_distribution = tfd.Normal(loc=[95., 85.], scale=[5., 5.])
+observation_distribution = tfd.Normal(loc=[100., 20.], scale=[5., 5.])
+
+
+"""hidden_chain, observed_chain = generate_chain(initial_distribution, transition_distribution,
+    observation_distribution, 1886)
+with open('hidden_chain.txt', 'w') as filehandle:
+    filehandle.writelines("%s\n" % obs for obs in hidden_chain)
+with open('observed_chain.txt', 'w') as filehandle:
+    filehandle.writelines("%s\n" % obs for obs in observed_chain)"""
+
+observations = [float(line.rstrip('\n')) for line in open('observed_chain.txt')]
 
 # Convert our observations into a tensor
-observations = tf.convert_to_tensor(hum_df.van_impute)
+observations = tf.convert_to_tensor(observations)
 observations = tf.cast(observations, tf.float32)
 print("Observations")
 print(observations)
@@ -58,7 +72,7 @@ model =  BaumWelch(initial_distribution=initial_distribution,
                    observation_distribution=observation_distribution,
                    transition_distribution=transition_distribution,
                    num_steps=1886,
-                   epsilon=0.0001,
+                   epsilon=0.02,
                    maxStep=1886)
 
 observations = tf.dtypes.cast(observations, dtype=tf.float32)

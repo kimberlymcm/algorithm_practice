@@ -94,22 +94,23 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
             the posterior probability of each state at each time step
         """
         obs_prob_list_for = tf.split(obs_prob_seq, self.N, 0) # creates a list of tensors for each observation
+        # Below is identical to obs_prob_seq, except it is logs
         observation_log_probs = self._observation_log_probs(x, mask=None)     
         with tf.name_scope('forward_belief_propagation'):
             # forward belief propagation
             print("BEFORE")
             print(self.forward_log_probs)
+            # This is consistent with the posterior marginals
             self._forward(observation_log_probs)
             print("AFTER")
             print(self.forward_log_probs)
 
-        obs_prob_seq_rev = tf.reverse(obs_prob_seq, [True, False])
-        obs_prob_list_back = tf.split(obs_prob_seq_rev, self.N, 0)
+        #obs_prob_seq_rev = tf.reverse(obs_prob_seq, [True, False])
+        #obs_prob_list_back = tf.split(obs_prob_seq_rev, self.N, 0)
 
         with tf.name_scope('backward_belief_propagation'):
             # backward belief propagation
             self._backward(observation_log_probs)
-        print(self.forward_log_probs)
         print(self.backward_log_probs)
         print("GOT THROUGH FORWARD BACKWARD")
 
@@ -118,6 +119,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
         print("In forward!")
     
         with tf.name_scope('forward_first_step'):
+            # prob_starting_in_each_state * prob_of_observed_state_given_hiddenstate[0]
             init_prob = self.initial_distribution.logits_parameter() + tf.squeeze(observation_log_probs[0])
             log_transition = self.transition_distribution.logits_parameter()
             log_adjoint_prob = tf.zeros_like(init_prob)
@@ -286,7 +288,8 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
             self.prob_state_1.append(self.gamma[:, 0])
         
         return T0_new, T_new
-    
+
+  
     def check_convergence(self, new_T0, new_transition, new_emission):
         delta_T0 = tf.reduce_max(tf.abs(self.initial_distribution.logits_parameter() - new_T0.logits_parameter())) < self.epsilon
         delta_T = tf.reduce_max(tf.abs(self.transition_distribution.logits_parameter() - new_transition.logits_parameter())) < self.epsilon
@@ -295,42 +298,34 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
         return tf.logical_and(tf.logical_and(delta_T0, delta_T), delta_E)
         
 
-
     def expectation_maximization_step(self, x): # x is the observations
-        
-        # probability of emission sequence
-        #obs_prob_seq = tf.gather(self.E, x) 
-        #obs_prob_seq = tf.gather(self.observation_distribution, x)
 
-        # Hopefully this is the log probability of the observed sequence
-        #import pdb; pdb.set_trace()
-
+        # probability of the emissions sequence
+        # THIS STEP LOOKS CORRECT
+        # Since I'm adding the exponent, this is the probability. 
+        # The output of self._observation_log_probs is the log_prob
         obs_prob_seq = tf.math.exp(self._observation_log_probs(x, mask=None)) # NOT LOGS
         print(obs_prob_seq)
+        print(x)
 
         ## probability of emission sequence
         with tf.name_scope('Forward_Backward'):
             print("above to run forward_backward")
             self.forward_backward(obs_prob_seq, x)
-            self.fb_array = self.forward_log_probs + self.backward_log_probs
+            #self.fb_array = self.forward_log_probs + self.backward_log_probs
             # Not sure what is happening here
             # Not sure if I need to do this
             total_log_prob = tf.reduce_logsumexp(self.forward_log_probs[-1], axis=-1)
             marginal_log_probs = distribution_util.move_dimension(self.fb_array - total_log_prob[..., tf.newaxis], 0, -2)
             self.fb_array = marginal_log_probs
-        #obs_prob_seq = tf.gather(self.E, x)
-        #with tf.name_scope('Forward_Backward'):
-        #    self.forward_backward(obs_prob_seq)
-
-        #with tf.name_scope('Forward_Backward'):
-            #self.forward_backward(obs_prob_seq)
-            # I guess I don't wanna actually store these
-            # need to get out the forward - bback
-            #fb = self.posterior_marginals(x, mask=None, name=None)
-            ## These are the forward / backward probabilities
-            #fb_array = np.array(fb.prob_parameter())
-            #print(fb_array)
-            #sys.exit()
+            print("FB_ARRAY")
+            print(self.fb_array)
+            tt = self.posterior_marginals(x, mask=None, name=None)
+            print("FB_ARRAY_REAL")
+            print(tt.logits_parameter()) # These don't seem like logs. JK they are, my logs are way off :(
+            print(tt.probs_parameter())
+            import sys; sys.exit() 
+            #mport pdb; pdb.set_trace()
 
         with tf.name_scope('Re_estimate_transition'):
             new_T0, new_transition = self.re_estimate_transition(x, self.fb_array)
@@ -354,31 +349,12 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
             #self.transition_distribution = tf.compat.v1.assign(self.transition_distribution, new_transition)
             self._initial_distribution = new_T0
             self._observation_distribution = new_emission
-            self._transition_distribution = new_transition
-            #self.T0 = tf.assign(self.T0, new_T0)
-            #self.E = tf.assign(self.E, new_emission)
-            #self.T = tf.assign(self.T, new_transition)
-            #self.count = tf.assign_add(self.count, 1)
-             
-            #with tf.name_scope('histogram_summary'):
-            #    _ = tf.summary.histogram(self.initial_distribution)
-            #    _ = tf.summary.histogram(self.transition_distribution)
-            #    _ = tf.summary.histogram(self.observation_distribution)
+            self._transition_distribution = new_transition # WHAT IS THE POINT OF TF.ASSIGN
+
         return converged
         
  
     def Baum_Welch_EM(self, obs_seq):
-        
-        with tf.name_scope('Input_Observed_Sequence'):
-            # length of observed sequence
-            #self.N = len(obs_seq)
-            self.N = len(np.array(obs_seq)) 
-
-            # shape of Variables
-            shape = [self.N, self.S]
-
-            # observed sequence
-            x = tf.constant(obs_seq, dtype=tf.float32, name='observation_sequence')
         
         converged = tf.cast(False, tf.bool)
         #self.count = tf.Variable(tf.constant(0))
@@ -387,24 +363,25 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
             for i in range(self.maxStep): # Loop through each step
                 
                 with tf.name_scope('EM_step-%s' %i):
-                    converged = self.expectation_maximization_step(x)
+                    converged = self.expectation_maximization_step(obs_seq)
                 print("II")
                 print(self._initial_distribution)
 
-      
         return converged
-    
-    def run_Baum_Welch_EM(self, obs_seq, summary=False, monitor_state_1=False):
 
-        observations = tf.convert_to_tensor(obs_seq)
-        observations = tf.cast(observations, tf.float32)
+  
+    def run_Baum_Welch_EM(self, observations, summary=False, monitor_state_1=False):
+
+
+        with tf.name_scope('Input_Observed_Sequence'):
+            self.N = len(np.array(observations))  # length of observed sequence
         
+        # sets first attempt at
+        # self.forward_log_probs, self.backward_log_probs, self.fbarray        
         fb_array = self.posterior_marginals(observations, mask=None, name=None)
         
-        converged = self.Baum_Welch_EM(obs_seq)
-        
-        # Summary
-        #summary_op = tf.summary.merge_all()
+        # Now runs Baum Welch
+        converged = self.Baum_Welch_EM(observations)
         
         with tf.Session() as sess:
             
@@ -421,6 +398,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
             #    summary_writer.add_summary(summary_str)
 
             return trans0, transition, emission, c
+
 
     def posterior_marginals(self, observations, mask=None, name=None):
         """Compute marginal posterior distribution for each state.

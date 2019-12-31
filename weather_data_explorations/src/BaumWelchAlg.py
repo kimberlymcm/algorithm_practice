@@ -33,8 +33,6 @@ def generate_chain(initial_distribution, transition_distribution, observation_di
     return hidden_chain, observed_chain
 
 
-
-
 class BaumWelch(tfp.distributions.HiddenMarkovModel):
     # When you add an __init__ to the child class, it will no longer
     # inherit the init from the parent class
@@ -51,7 +49,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
     - T0: Initial state probabilities of size S.
     """
 
-    def __init__(self, initial_distribution, observation_distribution, transition_distribution, num_steps, epsilon = 0.001, maxStep = 10):
+    def __init__(self, initial_distribution, observation_distribution, transition_distribution, num_steps, epsilon = 0.05, maxStep = 10):
 
         super().__init__(initial_distribution, transition_distribution, observation_distribution, num_steps)
   
@@ -98,25 +96,13 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
         observation_log_probs = self._observation_log_probs(x, mask=None)     
         with tf.name_scope('forward_belief_propagation'):
             # forward belief propagation
-            print("BEFORE")
-            print(self.forward_log_probs)
-            # This is consistent with the posterior marginals
             self._forward(observation_log_probs)
-            print("AFTER")
-            print(self.forward_log_probs)
-
-        #obs_prob_seq_rev = tf.reverse(obs_prob_seq, [True, False])
-        #obs_prob_list_back = tf.split(obs_prob_seq_rev, self.N, 0)
-
         with tf.name_scope('backward_belief_propagation'):
             # backward belief propagation
             self._backward(observation_log_probs)
-        print(self.backward_log_probs)
-        print("GOT THROUGH FORWARD BACKWARD")
 
 
     def _forward(self, observation_log_probs):
-        print("In forward!")
     
         with tf.name_scope('forward_first_step'):
             # prob_starting_in_each_state * prob_of_observed_state_given_hiddenstate[0]
@@ -184,28 +170,26 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
 
         
     def re_estimate_emission(self, x):
-        # KM NEED TO FIX THIS FOR LOGS
-        # import pdb; pdb.set_trace()
         
-        states_marginal = tf.reduce_sum(self.gamma, 0)
-        # 0s matrix, (1886, 2)
-        seq_one_hot = tf.cast(tf.one_hot(tf.cast(x, tf.int64), self.O, 1, 0), tf.float32)
-        emission_score = tf.reduce_logsumexp(seq_one_hot + self.gamma, axis=-2)
-        #emission_score = tf.matmul(tf.cast(seq_one_hot, tf.float32), self.gamma, transpose_a=True)
+        # pg 73: uj(t)*x(t)
+        tmp = tf.multiply(tf.math.exp(self.fb_array), tf.expand_dims(x, 1))
+        emission_score = tf.math.reduce_sum(tmp, 0)
+        emission_score_log = tf.math.log(emission_score)
 
-        # x, 
-        emission_score = tf.math.reduce_sum(tf.multiply(tf.math.exp(self.fb_array), tf.expand_dims(x, 1)), 0)
-        new_means = emission_score / states_marginal
+        denom = tf.math.reduce_logsumexp(self.fb_array, 0)
+        means_log = emission_score_log - denom
+        means = tf.math.exp(means_log)
 
-        new_variances = []
+        new_stds = []
         for i in range(self.O):
-            tmp_0 = (x - new_means[i])**2
-            tmp_1 = tf.tensordot(tf.math.exp(self.fb_array[:, i]), tmp_0, axes=1)
-            #tmp_1 = tf.math.reduce_sum(tf.multiply(tf.expand_dims(tf.transpose(tf.math.exp(self.fb_array[:, i]))), tf.expand_dims(tmp_0, 1)), 0)
-            new_var = tmp_1 / np.array(states_marginal)[i]
-            new_variances.append(new_var)
+            tmp_0 = (x - tf.math.exp(means_log[i]))**2
+            tmp_1 = tf.multiply(tf.math.exp(self.fb_array[:, i]), tmp_0) # not logs
+            variance_score = tf.math.reduce_sum(tmp_1, 0)
+            new_var = variance_score / tf.math.exp(denom[i])
+            new_std = tf.math.sqrt(new_var)
+            new_stds.append(new_std)
 
-        new_emissions = tfp.distributions.Normal(loc=np.array(new_means), scale=new_variances)
+        new_emissions = tfp.distributions.Normal(loc=means, scale=new_std)
 
         return new_emissions
 
@@ -215,117 +199,106 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
         with tf.name_scope('Init_3D_tensor'):
             # What is M??
             # M: v tensor (pg 70): num_states x num_states x num_observations
+            # u (pg 70) is the fb_array I think
             self.M = tf.Variable(tf.zeros((self.N-1, self.S, self.S), tf.float32))
+            # I think below should be the real denominator
+            total_log_prob = tf.reduce_logsumexp(self.forward_log_probs[-1], axis=-1)
         
         with tf.name_scope('3D_tensor_transition'):
             # For each observation
             for t in range(self.N - 1):
                 with tf.name_scope('time_step-%s' %t):
                     # tmp_0 = prob of being in state * prob of transitioning out of state
+                    # eq 4.14 pg 71
                     tmp_00 = tf.expand_dims(self.forward_log_probs[t, :], 0)
                     tmp_0 = _log_vector_matrix(tmp_00, self.transition_distribution.logits_parameter())
-                    #tmp_0 = tf.matmul(tf.expand_dims(self.forward_log_probs[t, :], 0), self.transition_distribution)
-                    #tmp_0 = tf.matmul(tf.expand_dims(fb_array[t, :], 0), self.T)
-                    # tmp_1 = prob_in_state_at_t * p_transitioning_to_state_y_at_t+1 * p_emitting_d_at_x+1_given_observed_state
-                    # KM I AM STUCK HERE. THE OBSERVATION_DISTRIBUTION is a NORMAL distribution,so I need to get those,
-                    # and then do the addition
-                    #import pdb; pdb.set_trace()
 
-                    # tmp_1 = tf.multiply(tmp_0, tf.expand_dims(tf.gather(self.observation_distribution.logits_parameter(), x[t+1]), 0))
-                    # My attempt below
-                    tmp_1 = tmp_0 + self._observation_distribution.log_prob(x[t+1])
+                    tmp_1 = tmp_0 + self._observation_distribution.log_prob(x[t+1]) 
+
                     denom = tf.squeeze(_log_vector_matrix(tmp_1, self.backward_log_probs[t+1, :]))
-                    #print("DENOM")
-                    #print(denom)
-                    #denom = tf.squeeze(tf.matmul(tmp_1, tf.expand_dims(self.backward_log_probs[t+1, :], 1)))
 
                 with tf.name_scope('Init_new_transition'):
                     trans_re_estimate = tf.Variable(tf.zeros((self.S, self.S), tf.float32))
-                
-                # For each state
-                # KM: This is what will need to be changed for the normal distribution
-                # Need to get the u matrix
-                #u_mat = tf.multiply(self.forward, self.backward) 
                 
                 # For each state:
                 #     forward[t, i] * transition[1->0, 1->1] * observation[1|0, 1|0] * backward[t+1]
                 for i in range(self.S):
                     with tf.name_scope('State-%s' %i):
                         # KM tried to fix
-                        #import pdb; pdb.set_trace()
+                        # P(being in state i at time t) * [P(trans i->j), P(i->i)]
                         tmp_0 = self.forward_log_probs[t, i] + np.array(self.transition_distribution.logits_parameter())[i, :]
+                        # [P(state i time t & [P(i->i), P(i->i)]) * [P(o|i), P[o|j]]
+                        # [P(state i time t & P(i->i) & P(o|i) & P(state i time t+1))]
+                        # [P(state i time t & P(i->j) & P(o|j) & P(state ij time t+1))]
                         numer = tmp_0 + self._observation_distribution.log_prob(x[t+1]) + self.backward_log_probs[t+1, :]
-                        #numer = self.forward[t, i] * self.T[i, :] * tf.gather(self.E, x[t+1]) * self.backward[t+1, :]
-                        # DOES THIS NEED TO BE numer - denom????
-                        trans_re_estimate = tf.compat.v1.scatter_update(trans_re_estimate, i, numer / denom)
-                        #for t in range(self.N)
+                        trans_re_estimate = tf.compat.v1.scatter_update(trans_re_estimate, i, numer - total_log_prob)
 
                 self.M = tf.compat.v1.scatter_update(self.M, t, trans_re_estimate)
 
-        # What is this doing
+
         with tf.name_scope('Smooth_gamma'):
-            # tf.reduce_sum is adding the two log_probs, going from 3D to 2D
-            # idk what squeeze does
-            self.gamma = tf.squeeze(tf.reduce_sum(self.M, 2))
-            # tf.reduce_sum(self.M, 0): Sums rows and then sums colomns, so it is 2x2
-            # tf.reduce_sum(self.gamma, 0): Sums rows so it is a 2x1
-            T_new = tf.reduce_sum(self.M, 0) / tf.expand_dims(tf.reduce_sum(self.gamma, 0), 1)
-            T_new = tfp.distributions.Categorical(T_new)
+
+            numer = tf.reduce_logsumexp(self.M, 0) #4x4, need to do this to get sums of logs
+            denom = tf.reduce_logsumexp(numer, 0) # Might need to be over axis 1, not 0
+            T_new_tmp = numer - denom
+            T_new = tfp.distributions.Categorical(logits=T_new_tmp)
         
         with tf.name_scope('New_init_states_prob'):
-            T0_new = tfp.distributions.Categorical(probs=self.gamma[0,:])
-
-        with tf.name_scope('Append_gamma_final_time_step'):
-            #import pdb; pdb.set_trace()
-            #prod = tf.expand_dims(tf.multiply(self.forward[self.N-1, :], self.backward[self.N-1, :]), 0)
-            prod = self.forward_log_probs[self.N-1, :] + self.backward_log_probs[self.N-1, :]
-            # THIS MIGHT NEED TO BE A SUBTRACTION TOO
-            ss = prod / tf.reduce_sum(prod)
-            #import pdb; pdb.set_trace()
-            #self.gamma = tf.concat([np.array(self.gamma), np.array(ss)], 0)
-            self.gamma = tf.compat.v1.concat([self.gamma, tf.expand_dims(ss, 0)], 0)
-
-            self.prob_state_1.append(self.gamma[:, 0])
+            # #1 pg 72
+            T0_new = tfp.distributions.Categorical(logits=self.fb_array[0, :])
         
         return T0_new, T_new
 
   
     def check_convergence(self, new_T0, new_transition, new_emission):
-        delta_T0 = tf.reduce_max(tf.abs(self.initial_distribution.logits_parameter() - new_T0.logits_parameter())) < self.epsilon
-        delta_T = tf.reduce_max(tf.abs(self.transition_distribution.logits_parameter() - new_transition.logits_parameter())) < self.epsilon
-        delta_E = tf.reduce_max(tf.abs(self.observation_distribution.mean() - new_emission.mean())) < self.epsilon
+        delta_T0 = tf.reduce_max(
+                       tf.abs(
+                           self.initial_distribution.probs_parameter() - new_T0.probs_parameter()
+                        ) / self.initial_distribution.probs_parameter()
+                       ) < self.epsilon
+        print(tf.reduce_max(
+                       tf.abs(
+                           self.initial_distribution.probs_parameter() - new_T0.probs_parameter()
+                        ) / self.initial_distribution.probs_parameter()
+                       ))
+        delta_T = tf.reduce_max(
+                        tf.abs(
+                            self.transition_distribution.probs_parameter() - new_transition.probs_parameter()
+                       ) / self.transition_distribution.probs_parameter()
+                    ) < self.epsilon
+        print(tf.reduce_max(
+                        tf.abs(
+                            self.transition_distribution.probs_parameter() - new_transition.probs_parameter()
+                       ) / self.transition_distribution.probs_parameter()
+                    ))
+        delta_E = tf.reduce_max(
+                        tf.abs(
+                            self.observation_distribution.mean() - new_emission.mean()
+                        ) / self.observation_distribution.mean()
+                    ) < self.epsilon
+        print(tf.reduce_max(
+                        tf.abs(
+                            self.observation_distribution.mean() - new_emission.mean()
+                        ) / self.observation_distribution.mean()
+                    ))
 
         return tf.logical_and(tf.logical_and(delta_T0, delta_T), delta_E)
         
 
     def expectation_maximization_step(self, x): # x is the observations
 
-        # probability of the emissions sequence
-        # THIS STEP LOOKS CORRECT
-        # Since I'm adding the exponent, this is the probability. 
-        # The output of self._observation_log_probs is the log_prob
         obs_prob_seq = tf.math.exp(self._observation_log_probs(x, mask=None)) # NOT LOGS
-        print(obs_prob_seq)
-        print(x)
 
         ## probability of emission sequence
         with tf.name_scope('Forward_Backward'):
-            print("above to run forward_backward")
             self.forward_backward(obs_prob_seq, x)
-            #self.fb_array = self.forward_log_probs + self.backward_log_probs
-            # Not sure what is happening here
-            # Not sure if I need to do this
+
             total_log_prob = tf.reduce_logsumexp(self.forward_log_probs[-1], axis=-1)
-            marginal_log_probs = distribution_util.move_dimension(self.fb_array - total_log_prob[..., tf.newaxis], 0, -2)
+            log_likelihoods = self.forward_log_probs + self.backward_log_probs
+            marginal_log_probs = distribution_util.move_dimension(
+                log_likelihoods - total_log_prob[..., tf.newaxis], 0, -2)
             self.fb_array = marginal_log_probs
-            print("FB_ARRAY")
-            print(self.fb_array)
-            tt = self.posterior_marginals(x, mask=None, name=None)
-            print("FB_ARRAY_REAL")
-            print(tt.logits_parameter()) # These don't seem like logs. JK they are, my logs are way off :(
-            print(tt.probs_parameter())
-            import sys; sys.exit() 
-            #mport pdb; pdb.set_trace()
+
 
         with tf.name_scope('Re_estimate_transition'):
             new_T0, new_transition = self.re_estimate_transition(x, self.fb_array)
@@ -357,15 +330,15 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
     def Baum_Welch_EM(self, obs_seq):
         
         converged = tf.cast(False, tf.bool)
-        #self.count = tf.Variable(tf.constant(0))
         
         with tf.name_scope('Train_Baum_Welch'):
             for i in range(self.maxStep): # Loop through each step
                 
                 with tf.name_scope('EM_step-%s' %i):
                     converged = self.expectation_maximization_step(obs_seq)
-                print("II")
-                print(self._initial_distribution)
+                    if converged == True:
+                        print("CONVERGED")
+                        break
 
         return converged
 
@@ -376,17 +349,16 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
         with tf.name_scope('Input_Observed_Sequence'):
             self.N = len(np.array(observations))  # length of observed sequence
         
-        # sets first attempt at
         # self.forward_log_probs, self.backward_log_probs, self.fbarray        
         fb_array = self.posterior_marginals(observations, mask=None, name=None)
         
         # Now runs Baum Welch
         converged = self.Baum_Welch_EM(observations)
         
-        with tf.Session() as sess:
+        #with tf.Session() as sess:
             
-            sess.run(tf.global_variables_initializer())
-            trans0, transition, emission, c = sess.run([self.T0, self.T, self.E, converged])
+        #    sess.run(tf.global_variables_initializer())
+        #    trans0, transition, emission, c = sess.run([self.T0, self.T, self.E, converged])
             
             #if monitor_state_1:
             #    self.state_summary = np.array([sess.run(g) for g in self.prob_state_1])
@@ -397,7 +369,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
             #    summary_str = sess.run(summary_op)
             #    summary_writer.add_summary(summary_str)
 
-            return trans0, transition, emission, c
+        #    return trans0, transition, emission, c
 
 
     def posterior_marginals(self, observations, mask=None, name=None):
@@ -462,7 +434,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
                 def forward_step(log_previous_step, log_prob_observation):
                   return _log_vector_matrix(log_previous_step,
                                             log_transition) + log_prob_observation
-
+ 
                 forward_log_probs = tf.scan(forward_step, observation_log_probs[1:],
                                             initializer=log_prob,
                                             name="forward_log_probs")
@@ -509,8 +481,8 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
                   log_likelihoods - total_log_prob[..., tf.newaxis], 0, -2)
 
               self.forward_log_probs = forward_log_probs
-              self.backward_log_probs = backward_log_adjoint_probs
-              self.fb_array = marginal_log_probs
+              self.backward_log_probs = backward_log_adjoint_probs # ends with 0s
+              self.fb_array = marginal_log_probs # doesn't end with 0s
 
               return categorical.Categorical(logits=marginal_log_probs)
 
@@ -523,17 +495,3 @@ def _log_vector_matrix(vs, ms):
 def _log_matrix_vector(ms, vs):
   """Multiply tensor of matrices by vectors assuming values stored are logs."""
   return tf.reduce_logsumexp(ms + vs[..., tf.newaxis, :], axis=-1)
-
-
-def _vector_matrix(vs, ms):
-  """Multiply tensor of vectors by matrices."""
-  return tf.reduce_sum(vs[..., tf.newaxis] * ms, axis=-2)
-
-
-def _extract_log_probs(num_states, dist):
-  """Tabulate log probabilities from a batch of distributions."""
-  states = tf.reshape(tf.range(num_states),
-                      tf.concat([[num_states],
-                                 tf.ones_like(dist.batch_shape_tensor())],
-                                axis=0))
-  return distribution_util.move_dimension(dist.log_prob(states), 0, -1)

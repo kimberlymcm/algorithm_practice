@@ -1,4 +1,5 @@
 """ Run Baum Welch on the humidity data """
+from datetime import datetime
 
 import pandas as pd
 import numpy as np
@@ -6,7 +7,7 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 
-from BaumWelchAlg import BaumWelch
+from baum_welch_alg import BaumWelch
 
 
 def read_data():
@@ -24,6 +25,9 @@ def read_data():
 
 
 def main():
+
+    now = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    logdir = "{}/run-{}/".format("../tf_logs", now)
     observations = read_data()
     observations = tf.constant(observations, dtype=tf.float32, name='observation_sequence')
 
@@ -32,14 +36,20 @@ def main():
     transition_distribution = tfd.Categorical(probs=[[0.95, 0.05],
                                                      [0.05, 0.95],
                                                     ])
-
     observation_distribution = tfd.Normal(loc=[90., 70.], scale=[5., 5.])
+    #initial_distribution = tfd.Categorical(probs=[0.33, 0.33, 0.34])
+    #transition_distribution = tfd.Categorical(probs=[[0.95, 0.025, 0.025],
+    #	                                             [0.025, 0.95, 0.025],
+    #	                                             [0.025, 0.025, 0.95]])
+    #observation_distribution = tfd.Normal(loc=[90., 70., 40.],
+    #	                                  scale=[5., 2., 20.])
     model = BaumWelch(initial_distribution=initial_distribution,
                       observation_distribution=observation_distribution,
                       transition_distribution=transition_distribution,
                       num_steps=1886,
                       epsilon=0.02,
-                      maxStep=50)
+                      maxStep=50,
+                      log_dir=logdir)
     initial_dist, trans_dist, observ_dist = model.run_Baum_Welch_EM(observations, summary=False, monitor_state_1=True)
 
 if __name__ == '__main__':

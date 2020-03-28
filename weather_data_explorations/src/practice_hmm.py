@@ -32,6 +32,7 @@ def main():
     observations = tf.constant(observations, dtype=tf.float32, name='observation_sequence')
 
     tfd = tfp.distributions
+    # Note that 'scale' is the standard deviation, not the variance
     initial_distribution = tfd.Categorical(probs=[0.5, 0.5])
     transition_distribution = tfd.Categorical(probs=[[0.95, 0.05],
                                                      [0.05, 0.95],

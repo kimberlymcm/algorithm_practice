@@ -5,7 +5,7 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 
-from BaumWelchAlg import BaumWelch
+from baum_welch_alg import BaumWelch
 
 
 def main():
@@ -14,7 +14,7 @@ def main():
     initial_distribution = tfd.Categorical(probs=[0.5, 0.5])
     transition_distribution = tfd.Categorical(probs=[[0.5, 0.5],
                                                      [0.5, 0.5],
-                                                     ])
+                                                      ])
     observation_distribution = tfd.Normal(loc=[80., 10.], scale=[40., 2.])
     observations = [float(line.rstrip('\n'))
                     for line in open('../data/observed_chain.txt')]
@@ -30,7 +30,7 @@ def main():
                       observation_distribution=observation_distribution,
                       transition_distribution=transition_distribution,
                       num_steps=1886,
-                      epsilon=0.02,
+                      epsilon=0.0002,
                       maxStep=1886)
 
     initial_dist, trans_dist, observ_dist = model.run_Baum_Welch_EM(

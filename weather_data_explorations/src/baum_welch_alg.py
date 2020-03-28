@@ -39,7 +39,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
                 self.epsilon = epsilon
 
                 # Number of possible states
-                self.S = np.int(self.initial_distribution.num_categories)
+                self.S = np.int(self.initial_distribution.probs.shape[0])
 
                 self.forward_log_probs = tf.Variable(
                     tf.zeros(self.S, dtype=tf.float64), name='forward')
@@ -145,23 +145,30 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
         """
         with tf.name_scope('update_emissions'):
             u_x = tf.multiply(tf.math.exp(self.fb_array), tf.expand_dims(x, 1)) # pg 73: uj(t)*x(t)
-            emission_score_log = tf.math.log(tf.math.reduce_sum(u_x, 0))
 
+            # Calculate means
+            emission_score_log = tf.math.log(tf.math.reduce_sum(u_x, 0))
             denom = tf.math.reduce_logsumexp(self.fb_array, 0)
             means_log = emission_score_log - denom
             means = tf.math.exp(means_log)
 
+            # Calculate standard deviations
+            # TODO(kmcmanus): vectorize more
             new_stds = []
             for i in range(self.S):
-                variance_array = (x - tf.math.exp(means_log[i]))**2
+                # (x_j - new_mean_state_i)**2
+                #variance_array = (x - tf.math.exp(means_log[i]))**2
+                variance_array = (x - means[i])**2
+                # (prob_in_state_i_at_obj_j) * (x_j - new_mean_state_i)**2
                 variance_array_x = tf.multiply(tf.math.exp(
                     self.fb_array[:, i]), variance_array)  # not logs
+                # sum the above
                 variance_score = tf.math.reduce_sum(variance_array_x, 0)
                 new_var = variance_score / tf.math.exp(denom[i])
                 new_std = tf.math.sqrt(new_var)
                 new_stds.append(new_std)
 
-            new_emissions = tfp.distributions.Normal(loc=means, scale=new_std)
+            new_emissions = tfp.distributions.Normal(loc=means, scale=new_stds)
 
         return new_emissions
 
@@ -263,10 +270,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
 
     def expectation_maximization_step(self, x):
 
-        obs_prob_seq = tf.math.exp(
-            self._observation_log_probs(
-                x, mask=None))  # NOT LOGS
-
+        # Step 1: Expectation
         # probability of emission sequence
         with tf.name_scope('Forward_Backward'):
             self.forward_backward(x)
@@ -278,6 +282,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
                 log_likelihoods - total_log_prob[..., tf.newaxis], 0, -2)
             self.fb_array = marginal_log_probs
 
+        # Step 2: Maximization
         with tf.name_scope('Re_estimate_transition'):
             new_T0, new_transition = self.re_estimate_transition(
                 x, self.fb_array)
@@ -285,6 +290,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
         with tf.name_scope('Re_estimate_emission'):
             new_emission = self.re_estimate_emission(x)
 
+        # Step 3: Check convergence
         with tf.name_scope('Check_Convergence'):
             print("NEW T0")
             print(new_T0.probs_parameter())
@@ -325,6 +331,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
             with summary_writer.as_default():
                 with tf.name_scope('EM_steps'):
                     for i in range(self.maxStep):
+                        print("current step", i)
                         converged = self.expectation_maximization_step(observations)
                         tf.summary.scalar('change_sum', converged, step=i)
                         if converged < self.epsilon:

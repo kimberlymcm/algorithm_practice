@@ -1,5 +1,6 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
+from scipy.special import logsumexp
 import numpy as np
 
 from tensorflow_probability.python.internal import distribution_util
@@ -8,7 +9,7 @@ from tensorflow_probability.python.internal import prefer_static
 
 class BaumWelch(tfp.distributions.HiddenMarkovModel):
     """
-    Extends the tensorflow HiddenMarkoModel class by implementing the BaumWelch ALgorithm
+    Extends the tensorflow HiddenMarkovModel class by implementing the Baum Welch Algorithm
     """
 
     def __init__(
@@ -35,7 +36,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
                 # Max number of iteration
                 self.maxStep = maxStep
 
-                # convergence criteria
+                # Convergence criteria
                 self.epsilon = epsilon
 
                 # Number of possible states
@@ -51,6 +52,7 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
                         dtype=tf.float64),
                     name='posterior')
 
+                self.log_likelihood = None
 
     def forward_backward(self, x):
         """
@@ -72,7 +74,6 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
 
         with tf.name_scope('backward_belief_propagation'):
             self.backward_log_probs = self._backward(observation_log_probs)
-
 
     def _forward(self, observation_log_probs):
 
@@ -132,10 +133,9 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
                 lambda: tf.convert_to_tensor([log_adjoint_prob]))
         return backward_log_adjoint_probs
 
-
     def re_estimate_emission(self, x):
         """
-        Updates the observation_distribution, assuming it is a normal dist 
+        Updates the observation_distribution, assuming it is a normal dist
         Arguments
         ---------
         - x : array of size N with the observations
@@ -144,7 +144,10 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
         - new_emissions: Normal dist with new inferred emissions
         """
         with tf.name_scope('update_emissions'):
-            u_x = tf.multiply(tf.math.exp(self.fb_array), tf.expand_dims(x, 1)) # pg 73: uj(t)*x(t)
+            u_x = tf.multiply(
+                tf.math.exp(
+                    self.fb_array), tf.expand_dims(
+                    x, 1))  # pg 73: uj(t)*x(t)
 
             # Calculate means
             emission_score_log = tf.math.log(tf.math.reduce_sum(u_x, 0))
@@ -157,7 +160,6 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
             new_stds = []
             for i in range(self.S):
                 # (x_j - new_mean_state_i)**2
-                #variance_array = (x - tf.math.exp(means_log[i]))**2
                 variance_array = (x - means[i])**2
                 # (prob_in_state_i_at_obj_j) * (x_j - new_mean_state_i)**2
                 variance_array_x = tf.multiply(tf.math.exp(
@@ -172,8 +174,18 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
 
         return new_emissions
 
-
     def re_estimate_transition(self, x, fb_array):
+        """
+        Updates the transition_distribution
+        Arguments
+        ---------
+        - x : array of size N with the observations
+        - fb_array : array of size N x S, forward_backward array
+        Returns
+        _________
+        - T0_new : initial state distribution
+        - T_new : reestimated transition matrix
+        """
 
         with tf.name_scope('Init_3D_tensor'):
             # M: v tensor (pg 70): num_states x num_states x num_observations
@@ -218,7 +230,8 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
                         # [P(state i time t & P(i->i) & P(o|i) & P(state i time t+1))]
                         # [P(state i time t & P(i->j) & P(o|j) & P(state ij time t+1))]
                         numer = tmp_0 + \
-                            self._observation_distribution.log_prob(x[t + 1]) + self.backward_log_probs[t + 1, :]
+                            self._observation_distribution.log_prob(
+                                x[t + 1]) + self.backward_log_probs[t + 1, :]
                         trans_re_estimate = tf.compat.v1.scatter_update(
                             trans_re_estimate, i, numer - total_log_prob)
 
@@ -240,35 +253,20 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
 
         return T0_new, T_new
 
-    def check_convergence(self, new_T0, new_transition, new_emission):
-        # TODO (kmcmanus): Log output to a file
-        delta_T0 = tf.reduce_max(
-            tf.abs(
-                self.initial_distribution.probs_parameter() -
-                new_T0.probs_parameter()) /
-            self.initial_distribution.probs_parameter())
-        delta_T0_less = delta_T0 < self.epsilon
-        print(delta_T0)
+    def check_convergence(self, x):
 
-        delta_T = tf.reduce_max(
-            tf.abs(
-                self.transition_distribution.probs_parameter() -
-                new_transition.probs_parameter()) /
-            self.transition_distribution.probs_parameter())
-        delta_T_less = delta_T < self.epsilon
+        # Get model ll
+        new_log_likelihood = self._calculate_ll(x)
+        print('original ll: {}    new ll: {}'.format(
+            self.log_likelihood, new_log_likelihood))
 
-        delta_E = tf.reduce_max(
-            tf.abs(
-                self.observation_distribution.mean() - new_emission.mean()
-            ) / self.observation_distribution.mean()
-        ) 
-        delta_E_less = delta_E < self.epsilon
+        #new_log_likelihood = logsumexp(self.forward_log_probs[self.forward_log_probs.shape[0] - 1, :].numpy())
+        log_likelihood_diff = new_log_likelihood - self.log_likelihood
+        self.log_likelihood = new_log_likelihood
 
-        #return tf.logical_and(tf.logical_and(delta_T0_less, delta_T_less), delta_E_less)
-        return delta_T0 + delta_T + delta_E
+        return bool(log_likelihood_diff < self.epsilon)
 
-
-    def expectation_maximization_step(self, x):
+    def expectation_maximization_step(self, x, step):
 
         # Step 1: Expectation
         # probability of emission sequence
@@ -290,57 +288,70 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
         with tf.name_scope('Re_estimate_emission'):
             new_emission = self.re_estimate_emission(x)
 
-        # Step 3: Check convergence
-        with tf.name_scope('Check_Convergence'):
-            print("NEW T0")
-            print(new_T0.probs_parameter())
-            print("NEW TRANSITION")
-            print(new_transition.probs_parameter())
-            print("NEW EMISSION")
-            print(new_emission.mean())
-            print(new_emission.variance())
-            converged = self.check_convergence(
-                new_T0, new_transition, new_emission)
-
         with tf.name_scope('Update_parameters'):
-            #self.initial_distribution = tf.compat.v1.assign(self.initial_distribution, new_T0)
-            #self.observation_distribution = tf.compat.v1.assign(self.observation_distribution, new_emission)
-            #self.transition_distribution = tf.compat.v1.assign(self.transition_distribution, new_transition)
             self._initial_distribution = new_T0
             self._observation_distribution = new_emission
             self._transition_distribution = new_transition
 
+        # Step 3: Check convergence
+        with tf.name_scope('Check_Convergence'):
+            converged = self.check_convergence(x)
+            template = 'Epoch {}, T0: {}, Trans: {} \n Emiss_mean: {}, Emiss_std: {}'
+            print(template.format(step,
+                                  new_T0.probs_parameter().numpy(),
+                                  new_transition.probs_parameter().numpy(),
+                                  new_emission.mean().numpy(),
+                                  new_emission.stddev().numpy()))
+
         return converged
 
-    def run_Baum_Welch_EM(
-            self,
-            observations,
-            summary=False,
-            monitor_state_1=False):
+    def _calculate_ll(self, x):
+        """ Calculate initial log likelihood of the model """
+        observation_log_probs = self._observation_log_probs(x, mask=None)
+        forward_log_probs = self._forward(observation_log_probs)
+        log_likelihood = logsumexp(
+            forward_log_probs[forward_log_probs.shape[0] - 1, :].numpy())
+        return log_likelihood
+
+    def run_baum_welch_em(self, observations):
 
         with tf.name_scope('Train_Baum_Welch'):
 
             self.N = len(np.array(observations))
-            # converged = tf.cast(False, tf.bool)
             converged = tf.Variable(0)
 
-            #change_summary = tf.summary.scalar('change_sum', converged)
             summary_writer = tf.summary.create_file_writer(self.logdir)
-            #init = tf.global_variables_initializer()
 
-            with summary_writer.as_default():
-                with tf.name_scope('EM_steps'):
+            self.log_likelihood = self._calculate_ll(observations)
+
+            with tf.name_scope('EM_steps'):
+                with summary_writer.as_default():
                     for i in range(self.maxStep):
                         print("current step", i)
-                        converged = self.expectation_maximization_step(observations)
-                        tf.summary.scalar('change_sum', converged, step=i)
-                        if converged < self.epsilon:
-                            print("CONVERGED")
-                            break
-                    #filewriter.close()
+                        converged = self.expectation_maximization_step(
+                            x=observations, step=i)
+                        tf.summary.scalar(
+                            'log_likelihood', self.log_likelihood, step=i)
 
-        if converged:
-            print("Algorithm Converged")
+                        for s in range(self.S):
+                            tf.summary.scalar(
+                                'initial_dist_state{}'.format(s),
+                                self._initial_distribution.probs_parameter()[
+                                    s].numpy(),
+                                step=i)
+                            tf.summary.scalar('observation_state{}_mean'.format(
+                                s), self._observation_distribution.mean().numpy()[s], step=i)
+                            tf.summary.scalar('observation_state{}_stddev'.format(
+                                s), self._observation_distribution.stddev().numpy()[s], step=i)
+                            for ss in range(self.S):
+                                tf.summary.scalar(
+                                    'trans_state{}_tostate{}'.format(
+                                        s, ss), self._transition_distribution.probs_parameter()[
+                                        s, ss].numpy(), step=i)
+
+                        if converged:
+                            print("Algorithm Converged")
+                            break
 
         return self.initial_distribution, self.transition_distribution, self.observation_distribution
 

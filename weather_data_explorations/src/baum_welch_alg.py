@@ -327,7 +327,6 @@ class BaumWelch(tfp.distributions.HiddenMarkovModel):
             with tf.name_scope('EM_steps'):
                 with summary_writer.as_default():
                     for i in range(self.maxStep):
-                        print("current step", i)
                         converged = self.expectation_maximization_step(
                             x=observations, step=i)
                         tf.summary.scalar(
